@@ -98,7 +98,7 @@ def apply_doc_styling(df):
     if not doc_cols:
         return df
         
-    return df.style.applymap(style_doc, subset=doc_cols)
+    return df.style.map(style_doc, subset=doc_cols)
 
 def create_stock_pivot(df):
     if df.empty: return pd.DataFrame()
