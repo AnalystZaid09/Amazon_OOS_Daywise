@@ -58,16 +58,19 @@ with st.sidebar:
 
 def clean_numeric_col(df, col):
     if col in df.columns:
-        df[col] = (
-            df[col]
-            .astype(str)
-            .str.replace("₹", "")
-            .str.replace(",", "")
-            .str.replace(" ", "")
-            .str.replace("%", "")
-            .fillna("0")
+        series = df[col]
+        if pd.api.types.is_numeric_dtype(series):
+            return series.fillna(0)
+        
+        # If not numeric, clean it
+        cleaned = (
+            series.astype(str)
+            .str.replace(r"[₹, %]", "", regex=True)
+            .str.strip()
         )
-        return pd.to_numeric(df[col], errors="coerce").fillna(0)
+        # Handle empty strings after replace
+        cleaned = cleaned.replace('', '0')
+        return pd.to_numeric(cleaned, errors="coerce").fillna(0)
     return pd.Series(0, index=df.index)
 
 def apply_doc_styling(df):
@@ -247,38 +250,41 @@ def create_excel(df_dict, intervals):
             font_white = Font(color="FFFFFF", bold=True)
             font_black = Font(color="000000", bold=True)
 
-            # Apply styling to DOC columns
+            # Apply styling to DOC columns efficiently
             doc_cols = [c for c in df.columns if "DOC" in c]
-            col_indices = [df.columns.get_loc(c) + 1 for c in doc_cols]
-            
-            for r in range(2, worksheet.max_row + 1):
+            if doc_cols:
+                col_indices = [df.columns.get_loc(c) + 1 for c in doc_cols]
+                
+                # Pre-fetch colors to avoid dictionary overhead in loop
+                c_critical = colors["critical"]
+                c_low = colors["low"]
+                c_optimal = colors["optimal"]
+                c_monitor = colors["monitor"]
+                c_high = colors["high"]
+                c_excess = colors["excess"]
+                c_overstock = colors["overstock"]
+
                 for c_idx in col_indices:
-                    cell = worksheet.cell(row=r, column=c_idx)
-                    try:
-                        val = float(cell.value)
-                        if val <= 7:
-                            cell.fill = colors["critical"]
-                            cell.font = font_white
-                        elif val <= 15:
-                            cell.fill = colors["low"]
-                            cell.font = font_black
-                        elif val <= 30:
-                            cell.fill = colors["optimal"]
-                            cell.font = font_white
-                        elif val <= 45:
-                            cell.fill = colors["monitor"]
-                            cell.font = font_black
-                        elif val <= 60:
-                            cell.fill = colors["high"]
-                            cell.font = font_black
-                        elif val <= 90:
-                            cell.fill = colors["excess"]
-                            cell.font = font_white
-                        else:
-                            cell.fill = colors["overstock"]
-                            cell.font = font_white
-                    except:
-                        pass
+                    for r in range(2, worksheet.max_row + 1):
+                        cell = worksheet.cell(row=r, column=c_idx)
+                        try:
+                            val = float(cell.value)
+                            if val <= 7:
+                                cell.fill, cell.font = c_critical, font_white
+                            elif val <= 15:
+                                cell.fill, cell.font = c_low, font_black
+                            elif val <= 30:
+                                cell.fill, cell.font = c_optimal, font_white
+                            elif val <= 45:
+                                cell.fill, cell.font = c_monitor, font_black
+                            elif val <= 60:
+                                cell.fill, cell.font = c_high, font_black
+                            elif val <= 90:
+                                cell.fill, cell.font = c_excess, font_white
+                            else:
+                                cell.fill, cell.font = c_overstock, font_white
+                        except:
+                            pass
                         
             # Header styling
             for cell in worksheet[1]:
@@ -336,12 +342,13 @@ if process_btn:
 
             # Calculate Total Stock using formula from previous integration: 
             # afn-fulfillable + fc-transfers + fc-processing
-            inventory_df["afn-fulfillable-qty"] = clean_numeric_col(inventory_df, "afn-fulfillable-quantity")
+            # afn-warehouse-qty + fc-transfers + fc-processing
+            inventory_df["afn-warehouse-qty"] = clean_numeric_col(inventory_df, "afn-warehouse-quantity")
             inventory_df["afn-reserved-qty"] = clean_numeric_col(inventory_df, "afn-reserved-quantity")
             
-            # Formula refinement: Total Stock is Fulfillable + non-order reserved
+            # Formula refinement: Total Stock is Warehouse + non-order reserved
             inventory_df["Total Stock"] = (
-                inventory_df["afn-fulfillable-qty"] - 
+                inventory_df["afn-warehouse-qty"] - 
                 inventory_df["reserved_customerorders"] +
                 inventory_df["reserved_fc-transfers"] + 
                 inventory_df["reserved_fc-processing"]
@@ -353,7 +360,7 @@ if process_btn:
                 clean_numeric_col(inventory_df, "afn-inbound-receiving-quantity")
             )
             
-            inv_cols = ["SKU", "Total Stock", "Transfer Stock", "afn-fulfillable-qty", "afn-reserved-qty", 
+            inv_cols = ["SKU", "Total Stock", "Transfer Stock", "afn-warehouse-qty", "afn-reserved-qty", 
                         "reserved_customerorders", "reserved_fc-transfers", "reserved_fc-processing"]
             if asin_col_inv:
                 inv_cols.append(asin_col_inv)
@@ -365,7 +372,7 @@ if process_btn:
             inv_subset = inv_subset.groupby("SKU").agg({
                 "Total Stock": "sum",
                 "Transfer Stock": "sum",
-                "afn-fulfillable-qty": "sum",
+                "afn-warehouse-qty": "sum",
                 "afn-reserved-qty": "sum",
                 "reserved_customerorders": "sum",
                 "reserved_fc-transfers": "sum",
@@ -438,33 +445,21 @@ if process_btn:
                     br_pivot = process_br(br_files[days], days)
                     consolidated_df = consolidated_df.merge(br_pivot, on="SKU", how="outer")
                     
-                    # Consolidate ASIN from BR if missing
-                    br_asin_col = f"(Parent) ASIN_{days}"
-                    if br_asin_col in consolidated_df.columns:
-                        if "(Parent) ASIN" not in consolidated_df.columns:
-                            consolidated_df["(Parent) ASIN"] = consolidated_df[br_asin_col]
-                        else:
-                            consolidated_df["(Parent) ASIN"] = consolidated_df["(Parent) ASIN"].fillna(consolidated_df[br_asin_col])
-                        consolidated_df.drop(columns=[br_asin_col], inplace=True)
-
-                    # Safety check for numeric columns that might have NaNs after outer join
-                    num_cols_to_fill = ["Total Stock", "Transfer Stock", "afn-fulfillable-qty", "afn-reserved-qty", 
-                                        "reserved_customerorders", "reserved_fc-transfers", "reserved_fc-processing", "CP", "MRP"]
-                    for col in num_cols_to_fill:
-                        if col in consolidated_df.columns:
-                            consolidated_df[col] = consolidated_df[col].fillna(0)
-
-                    # Fill NaN with 0 for current interval Sales and Page Views
+                    # Consolidated sales/views NaN filling
                     consolidated_df[f"{days} Days Sales Qty"] = consolidated_df[f"{days} Days Sales Qty"].fillna(0)
                     consolidated_df[f"{days} Days Page Views"] = consolidated_df[f"{days} Days Page Views"].fillna(0)
                     
-                    # Calculations
-                    consolidated_df[f"{days} Days DRR"] = (consolidated_df[f"{days} Days Sales Qty"] / days).round(2)
+                    # Vectorized calculations for speed
+                    drr_val = (consolidated_df[f"{days} Days Sales Qty"] / days).round(2)
+                    consolidated_df[f"{days} Days DRR"] = drr_val
                     
-                    # DOC calculation: avoid division by zero
-                    consolidated_df[f"{days} Days DOC"] = consolidated_df.apply(
-                        lambda row: round(row["Total Stock"] / row[f"{days} Days DRR"], 0) if row[f"{days} Days DRR"] > 0 else 0,
-                        axis=1
+                    # Vectorized DOC calculation (fast)
+                    consolidated_df[f"{days} Days DOC"] = (
+                        (consolidated_df["Total Stock"] / drr_val)
+                        .replace([np.inf, -np.inf], 0)
+                        .fillna(0)
+                        .round(0)
+                        .astype(int)
                     )
                     drr_cols.append(f"{days} Days DRR")
 
@@ -487,16 +482,26 @@ if process_btn:
                     consolidated_df["seller-sku"] = temp_sku.map(listing_skus_dict).fillna("")
                     consolidated_df["Listing Status"] = temp_sku.apply(lambda x: "Closed" if x in listing_skus_dict else "")
 
+            # Final safety check for all numeric columns (once, outside loop)
+            num_cols_final = ["Total Stock", "Transfer Stock", "afn-warehouse-qty", "afn-reserved-qty", 
+                              "reserved_customerorders", "reserved_fc-transfers", "reserved_fc-processing", "CP", "MRP"]
+            for col in num_cols_final:
+                if col in consolidated_df.columns:
+                    consolidated_df[col] = consolidated_df[col].fillna(0)
+
             # 5. Aggregate Metrics and Specialized Reports
             if drr_cols:
                 consolidated_df["Max DRR"] = consolidated_df[drr_cols].max(axis=1)
                 consolidated_df["Avg DRR"] = consolidated_df[drr_cols].mean(axis=1).round(2)
                 
-                # Base DOC for Inventory/OOS/Overstock based on Max DRR
-                consolidated_df["DOC (Max)"] = consolidated_df.apply(
-                    lambda row: round(row["Total Stock"] / row["Max DRR"], 0) if row["Max DRR"] > 0 else 0,
-                    axis=1
-                ).fillna(0).astype(int)
+                # Vectorized DOC (Max)
+                consolidated_df["DOC (Max)"] = (
+                    (consolidated_df["Total Stock"] / consolidated_df["Max DRR"])
+                    .replace([np.inf, -np.inf], 0)
+                    .fillna(0)
+                    .round(0)
+                    .astype(int)
+                )
 
             # Calculated Financial Columns
             if "CP" in consolidated_df.columns:
@@ -507,12 +512,12 @@ if process_btn:
 
             # Define Layout order precisely as requested by the user
             # SKU, (Parent) ASIN, Vendor SKU Codes, Brand, Brand Manager, Product Name, CP, 
-            # afn-fulfillable-qty, afn-reserved-qty, reserved_customerorders, reserved_fc-transfers, reserved_fc-processing, 
+            # afn-warehouse-qty, afn-reserved-qty, reserved_customerorders, reserved_fc-transfers, reserved_fc-processing, 
             # Total Stock, CP As Per Total Stock Qty, ... multi-day ...
             # seller-sku, Listing Status
             layout_meta = ["SKU", "(Parent) ASIN", "Vendor SKU Codes", "Brand", "Brand Manager", "Product Name", "CP"]
             
-            layout_stock = ["afn-fulfillable-qty", "afn-reserved-qty", "reserved_customerorders", 
+            layout_stock = ["afn-warehouse-qty", "afn-reserved-qty", "reserved_customerorders", 
                            "reserved_fc-transfers", "reserved_fc-processing", "Total Stock", "CP As Per Total Stock Qty"]
             
             layout_metrics = []
