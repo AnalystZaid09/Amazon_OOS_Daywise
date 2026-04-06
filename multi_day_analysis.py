@@ -349,9 +349,7 @@ if process_btn:
             # Formula refinement: Total Stock is Warehouse + non-order reserved
             inventory_df["Total Stock"] = (
                 inventory_df["afn-warehouse-qty"] - 
-                inventory_df["reserved_customerorders"] +
-                inventory_df["reserved_fc-transfers"] + 
-                inventory_df["reserved_fc-processing"]
+                inventory_df["reserved_customerorders"]
             )
             
             inventory_df["Transfer Stock"] = (
