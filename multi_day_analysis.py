@@ -140,7 +140,11 @@ def create_stock_pivot(df):
         df_copy[col] = pd.to_numeric(df_copy[col], errors="coerce").fillna(0)
     
     # Ensure index columns exist
-    index_cols = [c for c in ["Brand", "SKU"] if c in df_copy.columns]
+    index_cols = [c for c in ["Brand", "(Parent) ASIN"] if c in df_copy.columns]
+    if not index_cols:
+        # Fallback to SKU if (Parent) ASIN is missing
+        index_cols = [c for c in ["Brand", "SKU"] if c in df_copy.columns]
+    
     if not index_cols:
         return pd.DataFrame()
 
@@ -190,12 +194,18 @@ def process_br(file, days):
         st.error(f"Could not find a SKU column in Business Report for {days} days.")
         st.stop()
     
-    # Normalize SKU
+        # Normalize SKU for potential reporting, but we will group by ASIN
     df[sku_col_br] = df[sku_col_br].astype(str).str.strip().str.upper()
 
     # Find ASIN in BR
     asin_col_br = next((c for c in ["(Parent) ASIN", "ASIN", "asin"] if c in df.columns), None)
+    if not asin_col_br:
+        st.error(f"Could not find an ASIN column in Business Report for {days} days.")
+        st.stop()
     
+    # Normalize ASIN
+    df[asin_col_br] = df[asin_col_br].astype(str).str.strip().str.upper()
+
     # Total Page Views (B2C + B2B)
     df["Period Page Views"] = df["Page Views - Total"] + df["Page Views - Total - B2B"]
 
@@ -207,21 +217,19 @@ def process_br(file, days):
         "Buy Box Percentage": "mean",
         "Unit Session Percentage": "mean"
     }
-    if asin_col_br:
-        agg_dict[asin_col_br] = "first"
 
-    pivot = df.groupby(sku_col_br).agg(agg_dict).reset_index()
+    # Group by ASIN
+    pivot = df.groupby(asin_col_br).agg(agg_dict).reset_index()
     
+    # Rename columns with days prefix
     cols = [
-        "SKU", 
+        "(Parent) ASIN", 
         f"{days} Days Sales Qty", 
         f"{days} Days Page Views",
         f"{days} Days Sessions",
         f"{days} Days Buy Box %",
         f"{days} Days Unit Session %"
     ]
-    if asin_col_br:
-        cols.append(f"(Parent) ASIN_{days}")
 
     pivot.columns = cols
     return pivot
@@ -301,97 +309,113 @@ if process_btn:
             # 1. Process Inventory
             inventory_df = pd.read_csv(inv_file)
             
-            # Find SKU column in Inventory
-            sku_col_inv = next((c for c in ["sku", "Seller SKU", "SKU"] if c in inventory_df.columns), None)
-            if not sku_col_inv:
-                st.error("Could not find a SKU column in Inventory report. Expected 'sku', 'Seller SKU', or 'SKU'.")
-                st.stop()
-            
-            # Normalize SKU
-            inventory_df[sku_col_inv] = inventory_df[sku_col_inv].astype(str).str.strip().str.upper()
-            
             # Find ASIN column in Inventory
             asin_col_inv = next((c for c in ["asin", "ASIN"] if c in inventory_df.columns), None)
+            if not asin_col_inv:
+                st.error("Could not find an ASIN column in Inventory report. Expected 'asin' or 'ASIN'.")
+                st.stop()
+            
+            # Normalize ASIN
+            inventory_df[asin_col_inv] = inventory_df[asin_col_inv].astype(str).str.strip().str.upper()
+
+            # Find SKU column in Inventory (for reference)
+            sku_col_inv = next((c for c in ["sku", "Seller SKU", "SKU"] if c in inventory_df.columns), None)
+            if sku_col_inv:
+                inventory_df[sku_col_inv] = inventory_df[sku_col_inv].astype(str).str.strip().str.upper()
 
             # Process Reserved Report if provided
             reserved_df = pd.DataFrame()
             if res_file:
                 reserved_df = pd.read_csv(res_file)
-                sku_col_res = next((c for c in ["sku", "SKU", "Seller SKU"] if c in reserved_df.columns), None)
-                if sku_col_res:
-                    reserved_df = reserved_df.rename(columns={sku_col_res: "SKU"})
-                    # Ensure numeric
-                    for col in ["reserved_customerorders", "reserved_fc-transfers", "reserved_fc-processing"]:
-                        reserved_df[col] = clean_numeric_col(reserved_df, col)
-                    reserved_df = reserved_df.groupby("SKU")[["reserved_customerorders", "reserved_fc-transfers", "reserved_fc-processing"]].sum().reset_index()
-
-            # Merge Reserved into Inventory
-            inventory_df = inventory_df.rename(columns={sku_col_inv: "SKU"})
-            if not reserved_df.empty:
-                inventory_df = inventory_df.merge(reserved_df, on="SKU", how="left")
-                # Fill NaNs from reserved
+                asin_col_res = next((c for c in ["asin", "ASIN"] if c in reserved_df.columns), None)
+                if not asin_col_res:
+                    # Fallback to looking for SKU if ASIN is missing in reserved, but user said "from reserve in file column asin"
+                    st.error("Could not find an ASIN column in Reserved Inventory report.")
+                    st.stop()
+                
+                reserved_df[asin_col_res] = reserved_df[asin_col_res].astype(str).str.strip().str.upper()
+                
+                # Ensure numeric
                 for col in ["reserved_customerorders", "reserved_fc-transfers", "reserved_fc-processing"]:
-                    if col in inventory_df.columns:
-                        inventory_df[col] = inventory_df[col].fillna(0)
-                    else:
-                        inventory_df[col] = 0
-            else:
-                inventory_df["reserved_customerorders"] = 0
-                inventory_df["reserved_fc-transfers"] = 0
-                inventory_df["reserved_fc-processing"] = 0
+                    reserved_df[col] = clean_numeric_col(reserved_df, col)
+                
+                # Pivot Reserved by ASIN
+                reserved_df = reserved_df.groupby(asin_col_res)[["reserved_customerorders", "reserved_fc-transfers", "reserved_fc-processing"]].sum().reset_index()
+                reserved_df = reserved_df.rename(columns={asin_col_res: "(Parent) ASIN"})
 
-            # Calculate Total Stock using formula from previous integration: 
-            # afn-fulfillable + fc-transfers + fc-processing
-            # afn-warehouse-qty + fc-transfers + fc-processing
+            # Merge Reserved into Inventory (Pre-aggregation)
+            # rename inventory asin to (Parent) ASIN for consistency
+            inventory_df = inventory_df.rename(columns={asin_col_inv: "(Parent) ASIN"})
+            
+            # We don't join yet, we will pivot inventory by ASIN first to ensure match
+            # But we need basic cleaning on inventory metrics
             inventory_df["afn-warehouse-qty"] = clean_numeric_col(inventory_df, "afn-warehouse-quantity")
             inventory_df["afn-reserved-qty"] = clean_numeric_col(inventory_df, "afn-reserved-quantity")
-            
-            # Formula refinement: Total Stock is Warehouse + non-order reserved
-            inventory_df["Total Stock"] = (
-                inventory_df["afn-warehouse-qty"] - 
-                inventory_df["reserved_customerorders"]
-            )
-            
             inventory_df["Transfer Stock"] = (
                 clean_numeric_col(inventory_df, "afn-inbound-working-quantity") + 
                 clean_numeric_col(inventory_df, "afn-inbound-shipped-quantity") +
                 clean_numeric_col(inventory_df, "afn-inbound-receiving-quantity")
             )
-            
-            inv_cols = ["SKU", "Total Stock", "Transfer Stock", "afn-warehouse-qty", "afn-reserved-qty", 
-                        "reserved_customerorders", "reserved_fc-transfers", "reserved_fc-processing"]
-            if asin_col_inv:
-                inv_cols.append(asin_col_inv)
-            
-            inv_subset = inventory_df[inv_cols].copy()
-            if asin_col_inv:
-                inv_subset = inv_subset.rename(columns={asin_col_inv: "(Parent) ASIN"})
-            
-            inv_subset = inv_subset.groupby("SKU").agg({
-                "Total Stock": "sum",
-                "Transfer Stock": "sum",
+
+            # Pivot Inventory by ASIN
+            inv_agg_dict = {
                 "afn-warehouse-qty": "sum",
                 "afn-reserved-qty": "sum",
-                "reserved_customerorders": "sum",
-                "reserved_fc-transfers": "sum",
-                "reserved_fc-processing": "sum",
-                **({"(Parent) ASIN": "first"} if asin_col_inv else {})
-            }).reset_index()
+                "Transfer Stock": "sum"
+            }
+            if sku_col_inv:
+                inv_agg_dict[sku_col_inv] = "first" # Keep one SKU for reference
+            
+            inv_pivoted = inventory_df.groupby("(Parent) ASIN").agg(inv_agg_dict).reset_index()
+            if sku_col_inv:
+                inv_pivoted = inv_pivoted.rename(columns={sku_col_inv: "SKU"})
+
+            # Now merge Reserved with Pivoted Inventory
+            if not reserved_df.empty:
+                inv_subset = inv_pivoted.merge(reserved_df, on="(Parent) ASIN", how="outer")
+            else:
+                inv_subset = inv_pivoted.copy()
+                inv_subset["reserved_customerorders"] = 0
+                inv_subset["reserved_fc-transfers"] = 0
+                inv_subset["reserved_fc-processing"] = 0
+
+            # Fill NaNs for numeric columns after merge
+            num_fields = ["afn-warehouse-qty", "afn-reserved-qty", "Transfer Stock", 
+                          "reserved_customerorders", "reserved_fc-transfers", "reserved_fc-processing"]
+            for col in num_fields:
+                if col in inv_subset.columns:
+                    inv_subset[col] = inv_subset[col].fillna(0)
+                else:
+                    inv_subset[col] = 0
+
+            # Calculate Total Stock at ASIN level
+            inv_subset["Total Stock"] = (
+                inv_subset["afn-warehouse-qty"] - 
+                inv_subset["reserved_customerorders"] +
+                inv_subset["reserved_fc-transfers"] + 
+                inv_subset["reserved_fc-processing"]
+            )
 
             # 2. Process Purchase Master
             pm_df = pd.read_excel(pm_file)
             
+            # Find ASIN column in PM
+            asin_col_pm = next((c for c in ["ASIN", "(Parent) ASIN", "asin"] if c in pm_df.columns), None)
+            if not asin_col_pm:
+                st.error("Could not find an ASIN column in Purchase Master.")
+                st.stop()
+            
+            # Normalize ASIN
+            pm_df[asin_col_pm] = pm_df[asin_col_pm].astype(str).str.strip().str.upper()
+            pm_df = pm_df.rename(columns={asin_col_pm: "(Parent) ASIN"})
+
             # Find SKU column in PM
             possible_sku_cols = ["Seller SKU", "Amazon Sku Name", "SKU", "EasycomSKU", "sku", "Amazon Sku"]
             sku_col_pm = next((c for c in possible_sku_cols if c in pm_df.columns), None)
-            
-            if not sku_col_pm:
-                st.error(f"Could not find a SKU column in Purchase Master. Expected one of: {possible_sku_cols}")
-                st.stop()
-            
-            # Normalize SKU
-            pm_df[sku_col_pm] = pm_df[sku_col_pm].astype(str).str.strip().str.upper()
-                
+            if sku_col_pm:
+                pm_df[sku_col_pm] = pm_df[sku_col_pm].astype(str).str.strip().str.upper()
+                pm_df = pm_df.rename(columns={sku_col_pm: "SKU"})
+
             # Columns to keep (with safety checks)
             meta_cols = {
                 "Brand": "Brand",
@@ -399,39 +423,40 @@ if process_btn:
                 "Brand Manager": "Brand Manager",
                 "CP": "CP",
                 "MRP": "MRP",
-                "Vendor SKU Codes": "Vendor SKU Codes",
-                "ASIN": "(Parent) ASIN",
-                "(Parent) ASIN": "(Parent) ASIN",
-                "asin": "(Parent) ASIN"
+                "Vendor SKU Codes": "Vendor SKU Codes"
             }
-            cols_to_keep = [sku_col_pm]
+            
+            # Pivot PM by ASIN
+            pm_agg_dict = {}
             for orig, target in meta_cols.items():
-                if orig in pm_df.columns: cols_to_keep.append(orig)
+                if orig in pm_df.columns:
+                    if target in ["CP", "MRP"]:
+                        # Pre-clean numeric
+                        pm_df[orig] = pd.to_numeric(
+                            pm_df[orig].astype(str).str.replace(",", "", regex=False).str.strip(), 
+                            errors="coerce"
+                        ).fillna(0)
+                        pm_agg_dict[orig] = "mean" # Cost Price/MRP should be averaged or first
+                    else:
+                        pm_agg_dict[orig] = "first"
             
-            pm_subset = pm_df[cols_to_keep].copy()
-            pm_subset = pm_subset.rename(columns={sku_col_pm: "SKU", **{k:v for k,v in meta_cols.items() if k in pm_df.columns}})
-            pm_subset = pm_subset.drop_duplicates(subset=["SKU"])
-            
-            # Additional Processing for PM (CP and MRP cleaning)
-            for col in ["CP", "MRP"]:
-                if col in pm_subset.columns:
-                    pm_subset[col] = pd.to_numeric(
-                        pm_subset[col].astype(str).str.replace(",", "", regex=False).str.strip(), 
-                        errors="coerce"
-                    ).fillna(0)
+            if "SKU" in pm_df.columns:
+                pm_agg_dict["SKU"] = "first" # Keep one SKU for reference
 
-            # Listing Status and seller-sku lookup will be performed at the end to cover all merged SKUs
+            pm_subset = pm_df.groupby("(Parent) ASIN").agg(pm_agg_dict).reset_index()
+            pm_subset = pm_subset.rename(columns={k:v for k,v in meta_cols.items() if k in pm_subset.columns})
 
-            # 3. Process Business Reports
-            consolidated_df = pm_subset.merge(inv_subset, on="SKU", how="outer", suffixes=('', '_inv'))
+            # 3. Process Business Reports (Starting consolidation)
+            # Merge PM and Inventory on (Parent) ASIN
+            consolidated_df = pm_subset.merge(inv_subset, on="(Parent) ASIN", how="outer", suffixes=('', '_inv'))
             
-            # Consolidate (Parent) ASIN if it exists in both
-            if "(Parent) ASIN_inv" in consolidated_df.columns:
-                if "(Parent) ASIN" not in consolidated_df.columns:
-                    consolidated_df["(Parent) ASIN"] = consolidated_df["(Parent) ASIN_inv"]
+            # Handle SKU consolidation
+            if "SKU_inv" in consolidated_df.columns:
+                if "SKU" not in consolidated_df.columns:
+                    consolidated_df["SKU"] = consolidated_df["SKU_inv"]
                 else:
-                    consolidated_df["(Parent) ASIN"] = consolidated_df["(Parent) ASIN"].fillna(consolidated_df["(Parent) ASIN_inv"])
-                consolidated_df.drop(columns=["(Parent) ASIN_inv"], inplace=True)
+                    consolidated_df["SKU"] = consolidated_df["SKU"].fillna(consolidated_df["SKU_inv"])
+                consolidated_df.drop(columns=["SKU_inv"], inplace=True)
             
             consolidated_df["Total Stock"] = consolidated_df["Total Stock"].fillna(0)
             consolidated_df["Transfer Stock"] = consolidated_df["Transfer Stock"].fillna(0)
@@ -441,7 +466,8 @@ if process_btn:
             for days in intervals:
                 if br_files[days]:
                     br_pivot = process_br(br_files[days], days)
-                    consolidated_df = consolidated_df.merge(br_pivot, on="SKU", how="outer")
+                    # br_pivot is already keyed by (Parent) ASIN
+                    consolidated_df = consolidated_df.merge(br_pivot, on="(Parent) ASIN", how="outer")
                     
                     # Consolidated sales/views NaN filling
                     consolidated_df[f"{days} Days Sales Qty"] = consolidated_df[f"{days} Days Sales Qty"].fillna(0)
@@ -513,7 +539,7 @@ if process_btn:
             # afn-warehouse-qty, afn-reserved-qty, reserved_customerorders, reserved_fc-transfers, reserved_fc-processing, 
             # Total Stock, CP As Per Total Stock Qty, ... multi-day ...
             # seller-sku, Listing Status
-            layout_meta = ["SKU", "(Parent) ASIN", "Vendor SKU Codes", "Brand", "Brand Manager", "Product Name", "CP"]
+            layout_meta = ["(Parent) ASIN", "SKU", "Vendor SKU Codes", "Brand", "Brand Manager", "Product Name", "CP"]
             
             layout_stock = ["afn-warehouse-qty", "afn-reserved-qty", "reserved_customerorders", 
                            "reserved_fc-transfers", "reserved_fc-processing", "Total Stock", "CP As Per Total Stock Qty"]
